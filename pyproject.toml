@@ -1,9 +1,11 @@
 [tool.poetry]
 name = "event-outbox"
-version = "0.1.1"
+version = "0.1.2"
 description = "Transactional outbox and idempotent consumer"
 authors = ["Yuriy Kehter <yuriy.kehter@gmail.com>"]
 packages = [{ include = "event_outbox" }]
+repository = "https://github.com/returnnullptr/event-outbox"
+readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
