@@ -1,0 +1,9 @@
+.idea
+.mypy_cache
+.vscode
+__pycache__
+.pytest_cache
+htmlcov
+dist
+.coverage
+coverage.xml

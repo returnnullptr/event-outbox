@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "event-outbox"
+version = "0.1.1"
+description = "Transactional outbox and idempotent consumer"
+authors = ["Yuriy Kehter <yuriy.kehter@gmail.com>"]
+packages = [{ include = "event_outbox" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiokafka = "^0.10.0"
+motor = "^3.4.0"
+pydantic = "^2.7.2"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.4.7"
+pytest = "^8.2.1"
+mypy = "^1.10.0"
+alt-pytest-asyncio = "^0.7.2"
+coverage = "^7.5.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[[tool.mypy.overrides]]
+module = ["aiokafka.*"]
+ignore_missing_imports = true
