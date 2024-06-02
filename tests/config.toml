@@ -1,0 +1,16 @@
+[test.mongo]
+connection_string = "mongodb://localhost:27018/test?directConnection=true"
+collection_outbox = "test_outbox"
+collection_inbox = "test_inbox"
+
+[test.kafka]
+bootstrap_servers = "localhost:9092"
+# TODO: Configure broker:
+#   min.insync.replicas = len(replicas) - 1
+
+[test.kafka.producer]
+topic = "test_topic"
+
+[test.kafka.consumer]
+group_id = "test_consumer_group"
+topics = ["test_topic"]

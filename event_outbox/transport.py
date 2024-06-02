@@ -107,13 +107,14 @@ class EventTransport:
     ) -> AbstractAsyncContextManager[None]:
         async def run_event_handler() -> AsyncIterator[None]:
             async with self._subscribe_to_mongo_change_stream(
-                # TODO: Load state to database
+                # TODO: Load state from database
                 start_after=None,
                 start_at_operation_type=None,
             ) as change_stream:
                 producer_loop = asyncio.create_task(
                     self._produce_messages(
                         change_stream,
+                        # TODO: Configure heartbeat interval
                         heartbeat=timedelta(minutes=5),
                     ),
                 )
@@ -144,7 +145,7 @@ class EventTransport:
                     ) as change_stream:
                         yield change_stream
                 except pymongo.errors.OperationFailure as ex:
-                    if ex.code in _FailedToResumeChangeStream:
+                    if ex.code in _ResumeChangeStreamErrorCode:
                         logging.getLogger(__name__).warning(
                             "Failed to start change stream of collection %r after %r.",
                             self.mongo_collection_outbox,
@@ -167,7 +168,7 @@ class EventTransport:
                     ) as change_stream:
                         yield change_stream
                 except pymongo.errors.OperationFailure as ex:
-                    if ex.code in _FailedToResumeChangeStream:
+                    if ex.code in _ResumeChangeStreamErrorCode:
                         logging.getLogger(__name__).critical(
                             "Failed to start change stream of collection %r "
                             "at operation time: %r",
@@ -322,7 +323,7 @@ class EventTransport:
                     break
 
 
-class _FailedToResumeChangeStream(IntEnum):
+class _ResumeChangeStreamErrorCode(IntEnum):
     CHANGE_STREAM_FATAL_ERROR = 280
     CHANGE_STREAM_HISTORY_LOST = 286
 

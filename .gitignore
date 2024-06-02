@@ -1,9 +1,17 @@
+# IDE
 .idea
-.mypy_cache
 .vscode
+
+# Caches
 __pycache__
+.mypy_cache
 .pytest_cache
-htmlcov
-dist
 .coverage
+htmlcov
 coverage.xml
+
+# Builds
+dist
+
+# Local test configuration
+tests/config.local.toml
