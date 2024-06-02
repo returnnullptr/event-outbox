@@ -1,8 +1,8 @@
-from .transport import Event, EventListener, EventHandler, EventTransport
+from .outbox import Event, EventListener, EventHandler, EventOutbox
 
 __all__ = [
     "Event",
     "EventListener",
     "EventHandler",
-    "EventTransport",
+    "EventOutbox",
 ]

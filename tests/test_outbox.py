@@ -12,7 +12,7 @@ from motor.motor_asyncio import (
     AsyncIOMotorDatabase,
 )
 
-from event_outbox import Event, EventHandler, EventTransport
+from event_outbox import Event, EventHandler, EventOutbox
 
 
 class ExpectedEvent(Event):
@@ -28,7 +28,7 @@ class TransactionFailure(Exception):
 
 
 async def test_event_delivery(
-    event_transport: EventTransport,
+    event_outbox: EventOutbox,
     mongo_client: AsyncIOMotorClient,
     topic: str,
 ) -> None:
@@ -42,28 +42,28 @@ async def test_event_delivery(
         event_handled.set()
 
     async with await mongo_client.start_session() as mongo_session:
-        async with event_transport.event_listener(mongo_session) as event_listener:
+        async with event_outbox.event_listener(mongo_session) as event_listener:
             expected_event = ExpectedEvent(topic=topic)
             event_listener.event_occurred(expected_event)
 
-    async with event_transport.run_event_handler(event_handler):
+    async with event_outbox.run_event_handler(event_handler):
         await event_handled.wait()
 
 
 async def test_transactional_outbox(
-    event_transport: EventTransport,
+    event_outbox: EventOutbox,
     mongo_client: AsyncIOMotorClient,
     outbox: AsyncIOMotorCollection,
     topic: str,
 ) -> None:
     async with await mongo_client.start_session() as session:
         with suppress(TransactionFailure):
-            async with event_transport.event_listener(session) as listener:
+            async with event_outbox.event_listener(session) as listener:
                 unexpected_event = UnexpectedEvent(topic=topic)
                 listener.event_occurred(unexpected_event)
                 raise TransactionFailure
 
-        async with event_transport.event_listener(session) as listener:
+        async with event_outbox.event_listener(session) as listener:
             expected_event = ExpectedEvent(topic=topic)
             listener.event_occurred(expected_event)
 
@@ -86,27 +86,27 @@ async def test_transactional_outbox(
 
 
 async def test_transactional_outbox_duplicate_event_error(
-    event_transport: EventTransport,
+    event_outbox: EventOutbox,
     mongo_client: AsyncIOMotorClient,
     topic: str,
 ) -> None:
     async with await mongo_client.start_session() as session:
         with pytest.raises(pymongo.errors.BulkWriteError):
-            async with event_transport.event_listener(session) as listener:
+            async with event_outbox.event_listener(session) as listener:
                 duplicate_event = ExpectedEvent(topic=topic)
                 listener.event_occurred(duplicate_event)
                 listener.event_occurred(duplicate_event)
 
 
 async def test_transactional_inbox_deduplicate_events(
-    event_transport: EventTransport,
+    event_outbox: EventOutbox,
     mongo_client: AsyncIOMotorClient,
     mongo_db: AsyncIOMotorDatabase,
     topic: str,
 ) -> None:
     duplicate_event = ExpectedEvent(topic=topic)
     for _ in range(2):
-        await event_transport.kafka_producer.send_and_wait(
+        await event_outbox.kafka_producer.send_and_wait(
             duplicate_event.topic,
             duplicate_event.model_dump_json().encode(),
             partition=0,
@@ -114,18 +114,18 @@ async def test_transactional_inbox_deduplicate_events(
 
     event_handler = AsyncMock(spec=EventHandler)
 
-    async with event_transport.run_event_handler(event_handler):
+    async with event_outbox.run_event_handler(event_handler):
         await asyncio.sleep(1)
 
     event_handler.assert_called_once()
 
 
 async def test_transactional_inbox_retry_handle(
-    event_transport: EventTransport,
+    event_outbox: EventOutbox,
     topic: str,
 ) -> None:
     expected_event = ExpectedEvent(topic=topic)
-    await event_transport.kafka_producer.send_and_wait(
+    await event_outbox.kafka_producer.send_and_wait(
         expected_event.topic,
         expected_event.model_dump_json().encode(),
         partition=0,
@@ -141,5 +141,5 @@ async def test_transactional_inbox_retry_handle(
         else:
             second_time_handled.set()
 
-    async with event_transport.run_event_handler(event_handler):
+    async with event_outbox.run_event_handler(event_handler):
         await second_time_handled.wait()

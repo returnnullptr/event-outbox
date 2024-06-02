@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "event-outbox"
-version = "0.1.2"
+version = "0.1.3"
 description = "Transactional outbox and idempotent consumer"
 authors = ["Yuriy Kehter <yuriy.kehter@gmail.com>"]
 packages = [{ include = "event_outbox" }]

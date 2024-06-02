@@ -11,7 +11,7 @@ from motor.motor_asyncio import (
     AsyncIOMotorDatabase,
 )
 
-from event_outbox import EventTransport
+from event_outbox import EventOutbox
 
 
 @pytest.fixture
@@ -83,14 +83,14 @@ async def kafka_consumer(config: LazySettings) -> AsyncIterator[AIOKafkaConsumer
 
 
 @pytest.fixture
-def event_transport(
+def event_outbox(
     config: LazySettings,
     mongo_client: AsyncIOMotorClient,
     mongo_db: AsyncIOMotorDatabase,
     kafka_producer: AIOKafkaProducer,
     kafka_consumer: AIOKafkaConsumer,
-) -> EventTransport:
-    return EventTransport(
+) -> EventOutbox:
+    return EventOutbox(
         mongo_client,
         kafka_producer,
         kafka_consumer,

@@ -19,7 +19,7 @@ from motor.motor_asyncio import (
 )
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-__all__ = ["Event", "EventListener", "EventTransport", "EventHandler"]
+__all__ = ["Event", "EventListener", "EventOutbox", "EventHandler"]
 
 
 class Event(BaseModel):
@@ -49,7 +49,7 @@ class EventHandler(Protocol):
         pass
 
 
-class EventTransport:
+class EventOutbox:
     def __init__(
         self,
         mongo_client: AsyncIOMotorClient,
