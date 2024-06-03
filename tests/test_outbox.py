@@ -143,3 +143,24 @@ async def test_transactional_inbox_retry_handle(
 
     async with event_outbox.run_event_handler(event_handler):
         await second_time_handled.wait()
+
+
+async def test_create_listener_in_event_handler(
+    event_outbox: EventOutbox,
+    topic: str,
+) -> None:
+    expected_event = ExpectedEvent(topic=topic)
+    await event_outbox.kafka_producer.send_and_wait(
+        expected_event.topic,
+        expected_event.model_dump_json().encode(),
+        partition=0,
+    )
+
+    event_handled = asyncio.Event()
+
+    async def event_handler(_: Event, session: AsyncIOMotorClientSession) -> None:
+        async with event_outbox.event_listener(session):
+            event_handled.set()
+
+    async with event_outbox.run_event_handler(event_handler):
+        await event_handled.wait()

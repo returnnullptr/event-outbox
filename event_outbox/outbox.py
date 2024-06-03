@@ -3,7 +3,12 @@ import logging
 import uuid
 from asyncio import CancelledError
 from collections import deque
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from contextlib import (
+    AbstractAsyncContextManager,
+    asynccontextmanager,
+    nullcontext,
+    suppress,
+)
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any, AsyncIterator, Deque, Mapping, Protocol
@@ -77,7 +82,7 @@ class EventOutbox:
         async def event_listener() -> AsyncIterator[EventListener]:
             events: Deque[Event] = deque()
             listener = EventListener(events)
-            async with mongo_session.start_transaction():
+            async with _ensure_in_transaction(mongo_session):
                 yield listener
                 documents = []
                 while events:
@@ -321,6 +326,14 @@ class EventOutbox:
                         continue
                     await self.kafka_consumer.commit()
                     break
+
+
+def _ensure_in_transaction(
+    mongo_session: AsyncIOMotorClientSession,
+) -> AbstractAsyncContextManager[Any]:
+    if bool(mongo_session.in_transaction):
+        return nullcontext()
+    return mongo_session.start_transaction()
 
 
 class _ResumeChangeStreamErrorCode(IntEnum):
