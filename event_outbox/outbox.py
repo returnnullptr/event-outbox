@@ -111,7 +111,7 @@ class EventOutbox:
         self, handler: EventHandler
     ) -> AbstractAsyncContextManager[None]:
         async def run_event_handler() -> AsyncIterator[None]:
-            async with self._subscribe_to_mongo_change_stream(
+            async with self._subscribe_to_outbox_change_stream(
                 # TODO: Load state from database
                 start_after=None,
                 start_at_operation_time=None,
@@ -136,7 +136,15 @@ class EventOutbox:
 
         return asynccontextmanager(run_event_handler)()
 
-    def _subscribe_to_mongo_change_stream(
+    @property
+    def _outbox(self):
+        return self.mongo_db[self.mongo_collection_outbox]
+
+    @property
+    def _inbox(self):
+        return self.mongo_db[self.mongo_collection_inbox]
+
+    def _subscribe_to_outbox_change_stream(
         self,
         start_after: Mapping[str, Any] | None,
         start_at_operation_time: datetime | None,
@@ -144,7 +152,7 @@ class EventOutbox:
         async def generator_func() -> AsyncIterator[AsyncIOMotorChangeStream]:
             if start_after:
                 try:
-                    async with self.mongo_db[self.mongo_collection_outbox].watch(
+                    async with self._outbox.watch(
                         [{"$match": {"operationType": {"$in": ["insert"]}}}],
                         start_after=start_after,
                     ) as change_stream:
@@ -167,7 +175,7 @@ class EventOutbox:
                     start_at_operation_time.isoformat(),
                 )
                 try:
-                    async with self.mongo_db[self.mongo_collection_outbox].watch(
+                    async with self._outbox.watch(
                         [{"$match": {"operationType": {"$in": ["insert"]}}}],
                         start_at_operation_time=Timestamp(start_at_operation_time, 1),
                     ) as change_stream:
@@ -184,14 +192,12 @@ class EventOutbox:
                     else:
                         raise
 
-            oldest_document = await self.mongo_db[
-                self.mongo_collection_outbox
-            ].find_one(
+            oldest_document = await self._outbox.find_one(
                 {},
                 {"payload.occurred_at": True},
                 sort={"payload.occurred_at": pymongo.ASCENDING},
             )
-            async with self.mongo_db[self.mongo_collection_outbox].watch(
+            async with self._outbox.watch(
                 [{"$match": {"operationType": {"$in": ["insert"]}}}],
                 start_at_operation_time=(
                     Timestamp(
@@ -224,7 +230,7 @@ class EventOutbox:
                         async with asyncio.timeout(heartbeat.total_seconds()):
                             change_event = await asyncio.shield(get_change_event)
                     except TimeoutError:
-                        # TODO: Save `start_at_operation_type` to database
+                        # TODO: Save `start_at_operation_time` to database
                         continue
                     else:
                         break
@@ -269,7 +275,7 @@ class EventOutbox:
                 kafka_consumer_record = await self.kafka_consumer.getone()
                 event = Event.model_validate_json(kafka_consumer_record.value)
                 try:
-                    await self.mongo_db[self.mongo_collection_inbox].insert_one(
+                    await self._inbox.insert_one(
                         {
                             "_id": event.model_dump(
                                 mode="json",
@@ -285,9 +291,7 @@ class EventOutbox:
                 while True:
                     try:
                         async with mongo_session.start_transaction():
-                            result = await self.mongo_db[
-                                self.mongo_collection_inbox
-                            ].update_one(
+                            result = await self._inbox.update_one(
                                 {
                                     "_id": event.model_dump(
                                         mode="json",
