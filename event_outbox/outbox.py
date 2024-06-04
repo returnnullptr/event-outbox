@@ -114,7 +114,7 @@ class EventOutbox:
             async with self._subscribe_to_mongo_change_stream(
                 # TODO: Load state from database
                 start_after=None,
-                start_at_operation_type=None,
+                start_at_operation_time=None,
             ) as change_stream:
                 producer_loop = asyncio.create_task(
                     self._produce_messages(
@@ -139,7 +139,7 @@ class EventOutbox:
     def _subscribe_to_mongo_change_stream(
         self,
         start_after: Mapping[str, Any] | None,
-        start_at_operation_type: datetime | None,
+        start_at_operation_time: datetime | None,
     ) -> AbstractAsyncContextManager[AsyncIOMotorChangeStream]:
         async def generator_func() -> AsyncIterator[AsyncIOMotorChangeStream]:
             if start_after:
@@ -160,16 +160,16 @@ class EventOutbox:
                     else:
                         raise
 
-            if start_at_operation_type:
+            if start_at_operation_time:
                 logging.getLogger(__name__).info(
                     "Start change stream of collection %r at operation time: %r",
                     self.mongo_collection_outbox,
-                    start_at_operation_type.isoformat(),
+                    start_at_operation_time.isoformat(),
                 )
                 try:
                     async with self.mongo_db[self.mongo_collection_outbox].watch(
                         [{"$match": {"operationType": {"$in": ["insert"]}}}],
-                        start_at_operation_time=Timestamp(start_at_operation_type, 1),
+                        start_at_operation_time=Timestamp(start_at_operation_time, 1),
                     ) as change_stream:
                         yield change_stream
                 except pymongo.errors.OperationFailure as ex:
@@ -178,7 +178,7 @@ class EventOutbox:
                             "Failed to start change stream of collection %r "
                             "at operation time: %r",
                             self.mongo_collection_outbox,
-                            start_at_operation_type.isoformat(),
+                            start_at_operation_time.isoformat(),
                             exc_info=True,
                         )
                     else:
