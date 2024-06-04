@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import suppress
+from datetime import timedelta
 from typing import Any, Literal
 from unittest.mock import AsyncMock
 
@@ -53,7 +54,7 @@ async def test_event_delivery(
 async def test_transactional_outbox(
     event_outbox: EventOutbox,
     mongo_client: AsyncIOMotorClient,
-    outbox: AsyncIOMotorCollection,
+    outbox_collection: AsyncIOMotorCollection,
     topic: str,
 ) -> None:
     async with await mongo_client.start_session() as session:
@@ -67,10 +68,10 @@ async def test_transactional_outbox(
             expected_event = ExpectedEvent(topic=topic)
             listener.event_occurred(expected_event)
 
-    assert await outbox.find_one(
+    assert await outbox_collection.find_one(
         {"payload": expected_event.model_dump(mode="json")},
     )
-    assert not await outbox.find_one(
+    assert not await outbox_collection.find_one(
         {"payload": unexpected_event.model_dump(mode="json")},
     )
 
@@ -176,3 +177,13 @@ async def test_create_listener_in_event_handler(
 
     async with event_outbox.run_event_handler(event_handler):
         await event_handled.wait()
+
+
+async def test_change_event_expiration(
+    event_outbox: EventOutbox,
+    event_expiration_seconds: int,
+) -> None:
+    event_outbox.mongo_event_expiration = timedelta(
+        seconds=event_expiration_seconds + 1
+    )
+    await event_outbox.create_indexes()

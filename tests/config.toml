@@ -2,6 +2,7 @@
 connection_string = "mongodb://localhost:27018/test?directConnection=true"
 collection_outbox = "test_outbox"
 collection_inbox = "test_inbox"
+event_expiration_seconds = 1
 
 [test.kafka]
 bootstrap_servers = "localhost:9092"

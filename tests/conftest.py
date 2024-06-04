@@ -34,6 +34,11 @@ async def topic(config: LazySettings) -> str:
 
 
 @pytest.fixture
+async def event_expiration_seconds(config: LazySettings) -> str:
+    return config.mongo.event_expiration_seconds
+
+
+@pytest.fixture
 async def mongo_client(config: LazySettings) -> AsyncIterator[AsyncIOMotorClient]:
     client = AsyncIOMotorClient(config.mongo.connection_string, tz_aware=True)
     yield client
@@ -50,7 +55,7 @@ async def mongo_db(
 
 
 @pytest.fixture
-def outbox(
+def outbox_collection(
     config: LazySettings,
     mongo_db: AsyncIOMotorDatabase,
 ) -> AsyncIOMotorCollection:

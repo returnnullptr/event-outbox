@@ -9,7 +9,8 @@ from contextlib import (
     nullcontext,
     suppress,
 )
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import IntEnum
 from typing import Any, AsyncIterator, Deque, Mapping, Protocol, cast
 
 import pymongo.errors
@@ -62,6 +63,7 @@ class EventOutbox:
         mongo_db: AsyncIOMotorDatabase | None = None,
         mongo_collection_outbox: str = "transactional-outbox",
         mongo_collection_inbox: str = "transactional-inbox",
+        mongo_event_expiration: timedelta = timedelta(days=1),
     ) -> None:
         self.mongo_client = mongo_client
         self.mongo_db = (
@@ -71,6 +73,7 @@ class EventOutbox:
         )
         self.mongo_collection_outbox = mongo_collection_outbox
         self.mongo_collection_inbox = mongo_collection_inbox
+        self.mongo_event_expiration = mongo_event_expiration
         self.kafka_consumer = kafka_consumer
         self.kafka_producer = kafka_producer
 
@@ -84,6 +87,8 @@ class EventOutbox:
             name="idempotency",
             unique=True,
         )
+        await self._ensure_outbox_ttl_index()
+        await self._ensure_inbox_ttl_index()
 
     def event_listener(
         self, mongo_session: AsyncIOMotorClientSession
@@ -137,6 +142,38 @@ class EventOutbox:
     @property
     def _inbox(self):
         return self.mongo_db[self.mongo_collection_inbox]
+
+    async def _ensure_inbox_ttl_index(self):
+        while True:
+            try:
+                await self._inbox.create_index(
+                    "handled_at",
+                    name="expiration",
+                    partialFilterExpression={"handled": True},
+                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
+                )
+                break
+            except pymongo.errors.OperationFailure as ex:
+                if ex.code == _OperationFailureCode.IndexOptionsConflict:
+                    await self._inbox.drop_index("expiration")
+                else:
+                    raise
+
+    async def _ensure_outbox_ttl_index(self):
+        while True:
+            try:
+                await self._outbox.create_index(
+                    "published_at",
+                    name="expiration",
+                    partialFilterExpression={"published": True},
+                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
+                )
+                break
+            except pymongo.errors.OperationFailure as ex:
+                if ex.code == _OperationFailureCode.IndexOptionsConflict:
+                    await self._outbox.drop_index("expiration")
+                else:
+                    raise
 
     async def _produce_messages(self, mongo_session: AsyncIOMotorClientSession) -> None:
         latest_handled_object_id: ObjectId | None = None
@@ -275,3 +312,7 @@ def _ensure_session_in_transaction(
 class _ChangeStreamInvalidated(Exception):
     def __init__(self, resume_token: Mapping[str, Any]) -> None:
         self.resume_token = resume_token
+
+
+class _OperationFailureCode(IntEnum):
+    IndexOptionsConflict = 85
