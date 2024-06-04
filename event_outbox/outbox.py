@@ -29,6 +29,7 @@ __all__ = ["Event", "EventListener", "EventOutbox", "EventHandler"]
 class Event(BaseModel):
     topic: str
     content_schema: str
+    partition_key: int = 0
     idempotency_key: str = Field(default_factory=lambda: uuid.uuid4().hex)
     occurred_at: AwareDatetime = Field(default_factory=lambda: datetime.now(tz=UTC))
 
@@ -176,41 +177,73 @@ class EventOutbox:
                     raise
 
     async def _produce_messages(self, mongo_session: AsyncIOMotorClientSession) -> None:
-        latest_handled_object_id: ObjectId | None = None
-        async for document in self._outbox.find(
-            {"published": False},
-            session=mongo_session,
-        ):
-            await self._publish_event(mongo_session, document)
-            latest_handled_object_id = document["_id"]
-
-        if latest_handled_object_id:
-            id_generated_at = latest_handled_object_id.generation_time
-            start_at_operation_time = Timestamp(id_generated_at, 0)
-        else:
-            cluster_time_document = cast(Mapping[str, Any], mongo_session.cluster_time)
-            start_at_operation_time = cluster_time_document["clusterTime"]
-
-        pipeline = [{"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}]
-        change_stream = self._outbox.watch(
-            pipeline,
-            start_at_operation_time=start_at_operation_time,
-            session=mongo_session,
-        )
+        assignment = self.kafka_consumer.assignment()
         while True:
             try:
-                async with change_stream:
-                    async for change_event in change_stream:
-                        if change_event["operationType"] == "invalidate":
-                            raise _ChangeStreamInvalidated(change_event["_id"])
-                        document = change_event["fullDocument"]
-                        await self._publish_event(mongo_session, document)
-            except _ChangeStreamInvalidated as ex:
+                latest_handled_object_id: ObjectId | None = None
+                async for document in self._outbox.find(
+                    {"published": False},
+                    session=mongo_session,
+                ):
+                    if assignment != self.kafka_consumer.assignment():
+                        raise _PartitionAssignmentChanged
+
+                    await self._publish_event(mongo_session, document)
+                    latest_handled_object_id = document["_id"]
+
+                if latest_handled_object_id:
+                    id_generated_at = latest_handled_object_id.generation_time
+                    start_at_operation_time = Timestamp(id_generated_at, 0)
+                else:
+                    cluster_time_document = cast(
+                        Mapping[str, Any], mongo_session.cluster_time
+                    )
+                    start_at_operation_time = cluster_time_document["clusterTime"]
+
+                pipeline = [
+                    {"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}
+                ]
                 change_stream = self._outbox.watch(
                     pipeline,
-                    start_after=ex.resume_token,
+                    start_at_operation_time=start_at_operation_time,
                     session=mongo_session,
                 )
+                while True:
+                    async with change_stream:
+                        try:
+                            while True:
+                                wait_next_change_event = asyncio.create_task(
+                                    anext(change_stream)
+                                )
+                                while True:
+                                    try:
+                                        change_event = await asyncio.wait_for(
+                                            asyncio.shield(wait_next_change_event),
+                                            timeout=1,  # TODO: Configure timeout
+                                        )
+                                        break
+                                    except TimeoutError:
+                                        if (
+                                            assignment
+                                            != self.kafka_consumer.assignment()
+                                        ):
+                                            wait_next_change_event.cancel()
+                                            raise _PartitionAssignmentChanged
+
+                                if change_event["operationType"] == "invalidate":
+                                    raise _ChangeStreamInvalidated(change_event["_id"])
+
+                                document = change_event["fullDocument"]
+                                await self._publish_event(mongo_session, document)
+
+                        except _ChangeStreamInvalidated as ex:
+                            change_stream = self._outbox.watch(
+                                pipeline,
+                                start_after=ex.resume_token,
+                                session=mongo_session,
+                            )
+            except _PartitionAssignmentChanged:
+                assignment = self.kafka_consumer.assignment()
 
     async def _publish_event(
         self,
@@ -218,6 +251,16 @@ class EventOutbox:
         document: Mapping[str, Any],
     ) -> None:
         event = Event.model_validate(document["payload"])
+        partition = event.partition_key % len(
+            self.kafka_consumer.partitions_for_topic(event.topic)
+        )
+        if not any(
+            topic_partition.partition == partition
+            for topic_partition in self.kafka_consumer.assignment()
+            if topic_partition.topic == event.topic
+        ):
+            return
+
         async with mongo_session.start_transaction():
             published_at = datetime.now(tz=UTC)
             update_result = await self._outbox.update_one(
@@ -229,7 +272,7 @@ class EventOutbox:
                 await self.kafka_producer.send_and_wait(
                     event.topic,
                     event.model_dump_json().encode(),
-                    partition=0,
+                    partition=partition,
                     timestamp_ms=int(published_at.timestamp()),
                 )
             else:
@@ -312,6 +355,10 @@ def _ensure_session_in_transaction(
 class _ChangeStreamInvalidated(Exception):
     def __init__(self, resume_token: Mapping[str, Any]) -> None:
         self.resume_token = resume_token
+
+
+class _PartitionAssignmentChanged(Exception):
+    pass
 
 
 class _OperationFailureCode(IntEnum):
