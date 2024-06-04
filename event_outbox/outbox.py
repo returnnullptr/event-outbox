@@ -197,7 +197,7 @@ class EventOutbox:
                 )
             else:
                 logging.getLogger(__name__).info(
-                    "Already published event %r from %r collection skipped",
+                    "Skipped already published event %r from %r collection",
                     document["_id"],
                     self.mongo_collection_outbox,
                 )
@@ -207,55 +207,46 @@ class EventOutbox:
             while True:
                 kafka_consumer_record = await self.kafka_consumer.getone()
                 event = Event.model_validate_json(kafka_consumer_record.value)
-                try:
+
+                document_id = event.model_dump(
+                    mode="json",
+                    include={"topic", "content_schema", "idempotency_key"},
+                )
+
+                with suppress(pymongo.errors.DuplicateKeyError):
                     await self._inbox.insert_one(
-                        {
-                            "_id": event.model_dump(
-                                mode="json",
-                                include={"topic", "content_schema", "idempotency_key"},
-                            ),
-                            "handled": False,
-                        },
+                        {"_id": document_id, "handled": False},
                         session=mongo_session,
                     )
-                except pymongo.errors.DuplicateKeyError:
-                    pass
 
                 while True:
                     try:
-                        await self._handle_event(event, mongo_session, handler)
-                    except Exception as ex:
-                        logging.getLogger(__name__).critical(
-                            "Failed to handle event %r: %r",
-                            event.model_dump(
-                                mode="json",
-                                include={"topic", "content_schema", "idempotency_key"},
-                            ),
-                            ex,
+                        await self._handle_event(
+                            document_id, event, mongo_session, handler
                         )
-                        continue
-                    await self.kafka_consumer.commit()
-                    break
+                        await self.kafka_consumer.commit()
+                        break
+                    except Exception:  # noqa
+                        logging.getLogger(__name__).critical(
+                            "Failed to handle event %r from %r collection",
+                            document_id,
+                            self.mongo_collection_inbox,
+                            exc_info=True,
+                            stack_info=True,
+                        )
+                        # TODO: Configure delay between retries
+                        await asyncio.sleep(1)
 
     async def _handle_event(
         self,
+        document_id: Mapping[str, Any],
         event: Event,
         mongo_session: AsyncIOMotorClientSession,
         handler: EventHandler,
     ) -> None:
         async with mongo_session.start_transaction():
             result = await self._inbox.update_one(
-                {
-                    "_id": event.model_dump(
-                        mode="json",
-                        include={
-                            "topic",
-                            "content_schema",
-                            "idempotency_key",
-                        },
-                    ),
-                    "handled": False,
-                },
+                {"_id": document_id, "handled": False},
                 {
                     "$set": {
                         "handled": True,
@@ -264,10 +255,14 @@ class EventOutbox:
                 },
                 session=mongo_session,
             )
-            if not result.modified_count:
-                return
-
-            await handler(event, mongo_session)
+            if result.modified_count:
+                await handler(event, mongo_session)
+            else:
+                logging.getLogger(__name__).info(
+                    "Skipped already handled event %r from %r collection",
+                    document_id,
+                    self.mongo_collection_outbox,
+                )
 
 
 def _ensure_session_in_transaction(
