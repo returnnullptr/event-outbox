@@ -83,14 +83,14 @@ async def kafka_consumer(config: LazySettings) -> AsyncIterator[AIOKafkaConsumer
 
 
 @pytest.fixture
-def event_outbox(
+async def event_outbox(
     config: LazySettings,
     mongo_client: AsyncIOMotorClient,
     mongo_db: AsyncIOMotorDatabase,
     kafka_producer: AIOKafkaProducer,
     kafka_consumer: AIOKafkaConsumer,
 ) -> EventOutbox:
-    return EventOutbox(
+    event_outbox = EventOutbox(
         mongo_client,
         kafka_producer,
         kafka_consumer,
@@ -98,3 +98,5 @@ def event_outbox(
         mongo_collection_outbox=config.mongo.collection_outbox,
         mongo_collection_inbox=config.mongo.collection_inbox,
     )
+    await event_outbox.create_indexes()
+    return event_outbox

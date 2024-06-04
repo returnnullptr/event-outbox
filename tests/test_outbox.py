@@ -68,20 +68,10 @@ async def test_transactional_outbox(
             listener.event_occurred(expected_event)
 
     assert await outbox.find_one(
-        {
-            "_id": expected_event.model_dump(
-                mode="json",
-                include={"topic", "content_schema", "idempotency_key"},
-            )
-        }
+        {"payload": expected_event.model_dump(mode="json")},
     )
     assert not await outbox.find_one(
-        {
-            "_id": unexpected_event.model_dump(
-                mode="json",
-                include={"topic", "content_schema", "idempotency_key"},
-            )
-        }
+        {"payload": unexpected_event.model_dump(mode="json")},
     )
 
 
@@ -96,6 +86,28 @@ async def test_transactional_outbox_duplicate_event_error(
                 duplicate_event = ExpectedEvent(topic=topic)
                 listener.event_occurred(duplicate_event)
                 listener.event_occurred(duplicate_event)
+
+
+async def test_invalidate_mongo_change_stream(
+    mongo_client: AsyncIOMotorClient,
+    mongo_db: AsyncIOMotorDatabase,
+    event_outbox: EventOutbox,
+    topic: str,
+) -> None:
+    event_handled = asyncio.Event()
+
+    async def event_handler(_: Event, __: AsyncIOMotorClientSession) -> None:
+        event_handled.set()
+
+    async with event_outbox.run_event_handler(event_handler):
+        await mongo_client.drop_database(mongo_db)
+
+        async with await mongo_client.start_session() as mongo_session:
+            async with event_outbox.event_listener(mongo_session) as event_listener:
+                unexpected_event = UnexpectedEvent(topic=topic)
+                event_listener.event_occurred(unexpected_event)
+
+        await event_handled.wait()
 
 
 async def test_transactional_inbox_deduplicate_events(

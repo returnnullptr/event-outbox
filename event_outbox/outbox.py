@@ -9,15 +9,13 @@ from contextlib import (
     nullcontext,
     suppress,
 )
-from datetime import UTC, datetime, timedelta
-from enum import IntEnum
-from typing import Any, AsyncIterator, Deque, Mapping, Protocol
+from datetime import UTC, datetime
+from typing import Any, AsyncIterator, Deque, Mapping, Protocol, cast
 
 import pymongo.errors
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from bson import Timestamp
+from bson import ObjectId, Timestamp
 from motor.motor_asyncio import (
-    AsyncIOMotorChangeStream,
     AsyncIOMotorClient,
     AsyncIOMotorClientSession,
     AsyncIOMotorDatabase,
@@ -51,7 +49,7 @@ class EventHandler(Protocol):
         mongo_session: AsyncIOMotorClientSession,
         /,
     ) -> None:
-        pass
+        pass  # pragma: no cover
 
 
 class EventOutbox:
@@ -76,31 +74,35 @@ class EventOutbox:
         self.kafka_consumer = kafka_consumer
         self.kafka_producer = kafka_producer
 
+    async def create_indexes(self) -> None:
+        await self._outbox.create_index(
+            [
+                ("payload.topic", 1),
+                ("payload.content_schema", 1),
+                ("payload.idempotency_key", 1),
+            ],
+            name="idempotency",
+            unique=True,
+        )
+
     def event_listener(
         self, mongo_session: AsyncIOMotorClientSession
     ) -> AbstractAsyncContextManager[EventListener]:
         async def event_listener() -> AsyncIterator[EventListener]:
             events: Deque[Event] = deque()
             listener = EventListener(events)
-            async with _ensure_in_transaction(mongo_session):
+            async with _ensure_session_in_transaction(mongo_session):
                 yield listener
                 documents = []
                 while events:
                     event = events.popleft()
                     document = {
-                        "_id": event.model_dump(
-                            mode="json",
-                            include={"topic", "content_schema", "idempotency_key"},
-                        ),
-                        "payload": event.model_dump(
-                            mode="json",
-                            exclude={"topic", "content_schema", "idempotency_key"},
-                        ),
+                        "payload": event.model_dump(mode="json"),
                         "published": False,
                     }
                     documents.append(document)
                 if documents:
-                    await self.mongo_db[self.mongo_collection_outbox].insert_many(
+                    await self._outbox.insert_many(
                         documents,
                         session=mongo_session,
                     )
@@ -111,17 +113,9 @@ class EventOutbox:
         self, handler: EventHandler
     ) -> AbstractAsyncContextManager[None]:
         async def run_event_handler() -> AsyncIterator[None]:
-            async with self._subscribe_to_outbox_change_stream(
-                # TODO: Load state from database
-                start_after=None,
-                start_at_operation_time=None,
-            ) as change_stream:
+            async with await self.mongo_client.start_session() as mongo_session:
                 producer_loop = asyncio.create_task(
-                    self._produce_messages(
-                        change_stream,
-                        # TODO: Configure heartbeat interval
-                        heartbeat=timedelta(minutes=5),
-                    ),
+                    self._produce_messages(mongo_session),
                 )
                 consumer_loop = asyncio.create_task(
                     self._consume_messages(handler),
@@ -144,132 +138,71 @@ class EventOutbox:
     def _inbox(self):
         return self.mongo_db[self.mongo_collection_inbox]
 
-    def _subscribe_to_outbox_change_stream(
-        self,
-        start_after: Mapping[str, Any] | None,
-        start_at_operation_time: datetime | None,
-    ) -> AbstractAsyncContextManager[AsyncIOMotorChangeStream]:
-        async def generator_func() -> AsyncIterator[AsyncIOMotorChangeStream]:
-            if start_after:
-                try:
-                    async with self._outbox.watch(
-                        [{"$match": {"operationType": {"$in": ["insert"]}}}],
-                        start_after=start_after,
-                    ) as change_stream:
-                        yield change_stream
-                except pymongo.errors.OperationFailure as ex:
-                    if ex.code in _ResumeChangeStreamErrorCode:
-                        logging.getLogger(__name__).warning(
-                            "Failed to start change stream of collection %r after %r.",
-                            self.mongo_collection_outbox,
-                            start_after,
-                            exc_info=True,
-                        )
-                    else:
-                        raise
+    async def _produce_messages(self, mongo_session: AsyncIOMotorClientSession) -> None:
+        latest_handled_object_id: ObjectId | None = None
+        async for document in self._outbox.find(
+            {"published": False},
+            session=mongo_session,
+        ):
+            await self._publish_event(mongo_session, document)
+            latest_handled_object_id = document["_id"]
 
-            if start_at_operation_time:
-                logging.getLogger(__name__).info(
-                    "Start change stream of collection %r at operation time: %r",
-                    self.mongo_collection_outbox,
-                    start_at_operation_time.isoformat(),
-                )
-                try:
-                    async with self._outbox.watch(
-                        [{"$match": {"operationType": {"$in": ["insert"]}}}],
-                        start_at_operation_time=Timestamp(start_at_operation_time, 1),
-                    ) as change_stream:
-                        yield change_stream
-                except pymongo.errors.OperationFailure as ex:
-                    if ex.code in _ResumeChangeStreamErrorCode:
-                        logging.getLogger(__name__).critical(
-                            "Failed to start change stream of collection %r "
-                            "at operation time: %r",
-                            self.mongo_collection_outbox,
-                            start_at_operation_time.isoformat(),
-                            exc_info=True,
-                        )
-                    else:
-                        raise
+        if latest_handled_object_id:
+            id_generated_at = latest_handled_object_id.generation_time
+            start_at_operation_time = Timestamp(id_generated_at, 0)
+        else:
+            cluster_time_document = cast(Mapping[str, Any], mongo_session.cluster_time)
+            start_at_operation_time = cluster_time_document["clusterTime"]
 
-            oldest_document = await self._outbox.find_one(
-                {},
-                {"payload.occurred_at": True},
-                sort={"payload.occurred_at": pymongo.ASCENDING},
-            )
-            async with self._outbox.watch(
-                [{"$match": {"operationType": {"$in": ["insert"]}}}],
-                start_at_operation_time=(
-                    Timestamp(
-                        datetime.fromisoformat(
-                            oldest_document["payload"]["occurred_at"]
-                        ),
-                        1,
-                    )
-                    if oldest_document
-                    else None
-                ),
-            ) as change_stream:
-                yield change_stream
-
-        return asynccontextmanager(generator_func)()
-
-    async def _produce_messages(
-        self,
-        change_stream: AsyncIOMotorChangeStream,
-        *,
-        heartbeat: timedelta,
-    ) -> None:
+        pipeline = [{"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}]
+        change_stream = self._outbox.watch(
+            pipeline,
+            start_at_operation_time=start_at_operation_time,
+            session=mongo_session,
+        )
         while True:
-            get_change_event: asyncio.Task[Mapping[str, Any]] = asyncio.create_task(
-                anext(change_stream)
-            )
             try:
-                while True:
-                    try:
-                        async with asyncio.timeout(heartbeat.total_seconds()):
-                            change_event = await asyncio.shield(get_change_event)
-                    except TimeoutError:
-                        # TODO: Save `start_at_operation_time` to database
-                        continue
-                    else:
-                        break
-            except asyncio.CancelledError:
-                get_change_event.cancel()
+                async with change_stream:
+                    async for change_event in change_stream:
+                        if change_event["operationType"] == "invalidate":
+                            raise _ChangeStreamInvalidated(change_event["_id"])
+                        document = change_event["fullDocument"]
+                        await self._publish_event(mongo_session, document)
+            except _ChangeStreamInvalidated as ex:
+                change_stream = self._outbox.watch(
+                    pipeline,
+                    start_after=ex.resume_token,
+                    session=mongo_session,
+                )
 
-            document = change_event["fullDocument"]
-            event = Event.model_validate(document["_id"] | document["payload"])
-
-            async with await self.mongo_client.start_session() as mongo_session:
-                async with mongo_session.start_transaction():
-                    # TODO: Save `change_stream.resume_token` to database
-                    # TODO: Save `start_at_operation_type` to database
-                    published_at = datetime.now(tz=UTC)
-                    document = await self.mongo_db[
-                        self.mongo_collection_outbox
-                    ].find_one_and_update(
-                        {"_id": document["_id"], "published": False},
-                        {"$set": {"published": True, "published_at": published_at}},
-                        session=mongo_session,
-                    )
-                    if not document:
-                        logging.getLogger(__name__).info(
-                            "Already published event %r from %r collection skipped",
-                            change_event["_id"],
-                            self.mongo_collection_outbox,
-                            exc_info=True,
-                        )
-                        continue
-
-                    await self.kafka_producer.send_and_wait(
-                        event.topic,
-                        event.model_dump_json().encode(),
-                        partition=0,
-                        timestamp_ms=int(published_at.timestamp()),
-                    )
+    async def _publish_event(
+        self,
+        mongo_session: AsyncIOMotorClientSession,
+        document: Mapping[str, Any],
+    ) -> None:
+        event = Event.model_validate(document["payload"])
+        async with mongo_session.start_transaction():
+            published_at = datetime.now(tz=UTC)
+            update_result = await self._outbox.update_one(
+                {"_id": document["_id"], "published": False},
+                {"$set": {"published": True, "published_at": published_at}},
+                session=mongo_session,
+            )
+            if update_result.modified_count:
+                await self.kafka_producer.send_and_wait(
+                    event.topic,
+                    event.model_dump_json().encode(),
+                    partition=0,
+                    timestamp_ms=int(published_at.timestamp()),
+                )
+            else:
+                logging.getLogger(__name__).info(
+                    "Already published event %r from %r collection skipped",
+                    document["_id"],
+                    self.mongo_collection_outbox,
+                )
 
     async def _consume_messages(self, handler: EventHandler) -> None:
-        handled_kafka_messages = []
         async with await self.mongo_client.start_session() as mongo_session:
             while True:
                 kafka_consumer_record = await self.kafka_consumer.getone()
@@ -290,34 +223,7 @@ class EventOutbox:
 
                 while True:
                     try:
-                        async with mongo_session.start_transaction():
-                            result = await self._inbox.update_one(
-                                {
-                                    "_id": event.model_dump(
-                                        mode="json",
-                                        include={
-                                            "topic",
-                                            "content_schema",
-                                            "idempotency_key",
-                                        },
-                                    ),
-                                    "handled": False,
-                                },
-                                {
-                                    "$set": {
-                                        "handled": True,
-                                        "handled_at": datetime.now(tz=UTC),
-                                    }
-                                },
-                                session=mongo_session,
-                            )
-                            if not result.modified_count:
-                                raise _EventAlreadyHandledError
-
-                            handled_kafka_messages.append(kafka_consumer_record)
-                            await handler(event, mongo_session)
-                    except _EventAlreadyHandledError:
-                        pass
+                        await self._handle_event(event, mongo_session, handler)
                     except Exception as ex:
                         logging.getLogger(__name__).critical(
                             "Failed to handle event %r: %r",
@@ -331,8 +237,40 @@ class EventOutbox:
                     await self.kafka_consumer.commit()
                     break
 
+    async def _handle_event(
+        self,
+        event: Event,
+        mongo_session: AsyncIOMotorClientSession,
+        handler: EventHandler,
+    ) -> None:
+        async with mongo_session.start_transaction():
+            result = await self._inbox.update_one(
+                {
+                    "_id": event.model_dump(
+                        mode="json",
+                        include={
+                            "topic",
+                            "content_schema",
+                            "idempotency_key",
+                        },
+                    ),
+                    "handled": False,
+                },
+                {
+                    "$set": {
+                        "handled": True,
+                        "handled_at": datetime.now(tz=UTC),
+                    }
+                },
+                session=mongo_session,
+            )
+            if not result.modified_count:
+                return
 
-def _ensure_in_transaction(
+            await handler(event, mongo_session)
+
+
+def _ensure_session_in_transaction(
     mongo_session: AsyncIOMotorClientSession,
 ) -> AbstractAsyncContextManager[Any]:
     if bool(mongo_session.in_transaction):
@@ -340,10 +278,6 @@ def _ensure_in_transaction(
     return mongo_session.start_transaction()
 
 
-class _ResumeChangeStreamErrorCode(IntEnum):
-    CHANGE_STREAM_FATAL_ERROR = 280
-    CHANGE_STREAM_HISTORY_LOST = 286
-
-
-class _EventAlreadyHandledError(Exception):
-    pass
+class _ChangeStreamInvalidated(Exception):
+    def __init__(self, resume_token: Mapping[str, Any]) -> None:
+        self.resume_token = resume_token
