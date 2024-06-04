@@ -232,7 +232,6 @@ class EventOutbox:
                             document_id,
                             self.mongo_collection_inbox,
                             exc_info=True,
-                            stack_info=True,
                         )
                         # TODO: Configure delay between retries
                         await asyncio.sleep(1)
