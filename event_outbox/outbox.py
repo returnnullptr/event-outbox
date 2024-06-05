@@ -178,8 +178,8 @@ class EventOutbox:
                     raise
 
     async def _produce_messages(self, mongo_session: AsyncIOMotorClientSession) -> None:
-        assignment = self.kafka_consumer.assignment()
         while True:
+            assignment = self.kafka_consumer.assignment()
             try:
                 latest_handled_object_id: ObjectId | None = None
                 async for document in self._outbox.find(
@@ -244,7 +244,16 @@ class EventOutbox:
                                 session=mongo_session,
                             )
             except _PartitionAssignmentChanged:
-                assignment = self.kafka_consumer.assignment()
+                pass
+            except Exception:  # noqa, pragma: no cover
+                logging.getLogger(__name__).critical(
+                    "Unexpected exception occurred "
+                    "while publishing events from %r collection",
+                    self.mongo_collection_outbox,
+                    exc_info=True,
+                )
+                # TODO: Configure delay between retries
+                await asyncio.sleep(1)
 
     async def _publish_event(
         self,
@@ -287,34 +296,46 @@ class EventOutbox:
         self, mongo_session: AsyncIOMotorClientSession, handler: EventHandler
     ) -> None:
         while True:
-            kafka_consumer_record = await self.kafka_consumer.getone()
-            event = Event.model_validate_json(kafka_consumer_record.value)
+            try:
+                kafka_consumer_record = await self.kafka_consumer.getone()
+                event = Event.model_validate_json(kafka_consumer_record.value)
 
-            document_id = event.model_dump(
-                mode="json",
-                include={"topic", "content_schema", "idempotency_key"},
-            )
-
-            with suppress(pymongo.errors.DuplicateKeyError):
-                await self._inbox.insert_one(
-                    {"_id": document_id, "handled": False},
-                    session=mongo_session,
+                document_id = event.model_dump(
+                    mode="json",
+                    include={"topic", "content_schema", "idempotency_key"},
                 )
 
-            while True:
-                try:
-                    await self._handle_event(document_id, event, mongo_session, handler)
-                    await self.kafka_consumer.commit()
-                    break
-                except Exception:  # noqa
-                    logging.getLogger(__name__).critical(
-                        "Failed to handle event %r from %r collection",
-                        document_id,
-                        self.mongo_collection_inbox,
-                        exc_info=True,
+                with suppress(pymongo.errors.DuplicateKeyError):
+                    await self._inbox.insert_one(
+                        {"_id": document_id, "handled": False},
+                        session=mongo_session,
                     )
-                    # TODO: Configure delay between retries
-                    await asyncio.sleep(1)
+
+                while True:
+                    try:
+                        await self._handle_event(
+                            document_id, event, mongo_session, handler
+                        )
+                        await self.kafka_consumer.commit()
+                        break
+                    except Exception:  # noqa
+                        logging.getLogger(__name__).critical(
+                            "Failed to handle event %r from %r collection",
+                            document_id,
+                            self.mongo_collection_inbox,
+                            exc_info=True,
+                        )
+                        # TODO: Configure delay between retries
+                        await asyncio.sleep(1)
+            except Exception:  # noqa, pragma: no cover
+                logging.getLogger(__name__).critical(
+                    "Unexpected exception occurred "
+                    "while handling events from %r collection",
+                    self.mongo_collection_outbox,
+                    exc_info=True,
+                )
+                # TODO: Configure delay between retries
+                await asyncio.sleep(1)
 
     async def _handle_event(
         self,
