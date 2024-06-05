@@ -9,12 +9,13 @@ from contextlib import (
 )
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
-from typing import Any, AsyncIterator, Mapping, Protocol, cast
+from typing import Any, AsyncIterator, Mapping, Protocol, TypeAlias, cast
 
 import pymongo.errors
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from bson import ObjectId, Timestamp
 from motor.motor_asyncio import (
+    AsyncIOMotorChangeStream,
     AsyncIOMotorClient,
     AsyncIOMotorClientSession,
     AsyncIOMotorDatabase,
@@ -22,6 +23,8 @@ from motor.motor_asyncio import (
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 __all__ = ["Event", "EventListener", "EventOutbox", "EventHandler"]
+
+_ChangeEvent: TypeAlias = Mapping[str, Any]
 
 
 class Event(BaseModel):
@@ -213,23 +216,9 @@ class EventOutbox:
                     async with change_stream:
                         try:
                             while True:
-                                wait_next_change_event = asyncio.create_task(
-                                    anext(change_stream)
+                                change_event = await self._next_change_event(
+                                    change_stream, assignment
                                 )
-                                while True:
-                                    try:
-                                        change_event = await asyncio.wait_for(
-                                            asyncio.shield(wait_next_change_event),
-                                            timeout=1,  # TODO: Configure timeout
-                                        )
-                                        break
-                                    except TimeoutError:
-                                        if (
-                                            assignment
-                                            != self.kafka_consumer.assignment()
-                                        ):
-                                            wait_next_change_event.cancel()
-                                            raise _PartitionAssignmentChanged
 
                                 if change_event["operationType"] == "invalidate":
                                     raise _ChangeStreamInvalidated(change_event["_id"])
@@ -254,6 +243,22 @@ class EventOutbox:
                 )
                 # TODO: Configure delay between retries
                 await asyncio.sleep(1)
+
+    async def _next_change_event(
+        self,
+        change_stream: AsyncIOMotorChangeStream,
+        producer_assignment: frozenset[TopicPartition],
+    ) -> _ChangeEvent:
+        task: asyncio.Task[_ChangeEvent] = asyncio.create_task(anext(change_stream))
+        while True:
+            with suppress(TimeoutError):
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=1,  # TODO: Configure timeout
+                )
+            if producer_assignment != self.kafka_consumer.assignment():
+                task.cancel()
+                raise _PartitionAssignmentChanged
 
     async def _publish_event(
         self,
