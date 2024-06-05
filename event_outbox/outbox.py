@@ -97,14 +97,14 @@ class EventOutbox:
             listener = EventListener(events)
             async with _ensure_session_in_transaction(mongo_session):
                 yield listener
-                documents = [
-                    {
-                        "payload": event.model_dump(mode="json"),
-                        "published": False,
-                    }
-                    for event in events
-                ]
-                if documents:
+                if events:
+                    documents = [
+                        {
+                            "payload": event.model_dump(mode="json"),
+                            "published": False,
+                        }
+                        for event in events
+                    ]
                     events.clear()
                     await self._outbox.insert_many(
                         documents,
