@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import uuid
-from collections import deque
 from contextlib import (
     AbstractAsyncContextManager,
     asynccontextmanager,
@@ -10,7 +9,7 @@ from contextlib import (
 )
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
-from typing import Any, AsyncIterator, Deque, Mapping, Protocol, cast
+from typing import Any, AsyncIterator, Mapping, Protocol, cast
 
 import pymongo.errors
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -36,7 +35,7 @@ class Event(BaseModel):
 
 
 class EventListener:
-    def __init__(self, events: Deque[Event]) -> None:
+    def __init__(self, events: list[Event]) -> None:
         self.__events = events
 
     def event_occurred(self, event: Event) -> None:
@@ -94,19 +93,19 @@ class EventOutbox:
         self, mongo_session: AsyncIOMotorClientSession
     ) -> AbstractAsyncContextManager[EventListener]:
         async def event_listener() -> AsyncIterator[EventListener]:
-            events: Deque[Event] = deque()
+            events: list[Event] = []
             listener = EventListener(events)
             async with _ensure_session_in_transaction(mongo_session):
                 yield listener
-                documents = []
-                while events:
-                    event = events.popleft()
-                    document = {
+                documents = [
+                    {
                         "payload": event.model_dump(mode="json"),
                         "published": False,
                     }
-                    documents.append(document)
+                    for event in events
+                ]
                 if documents:
+                    events.clear()
                     await self._outbox.insert_many(
                         documents,
                         session=mongo_session,
