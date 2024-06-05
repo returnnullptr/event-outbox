@@ -273,7 +273,7 @@ class EventOutbox:
                     event.topic,
                     event.model_dump_json().encode(),
                     partition=partition,
-                    timestamp_ms=int(published_at.timestamp()),
+                    timestamp_ms=int(published_at.timestamp() * 1000),
                 )
             else:
                 logging.getLogger(__name__).info(
