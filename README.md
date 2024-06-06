@@ -2,6 +2,15 @@
 
 The project is not production ready yet.
 
+## Documentation
+
+- [Русский (Russian)](https://github.com/returnnullptr/event-outbox/tree/main/docs/ru-RU)
+- ___TODO:__ Translate documentation_
+
+## Usage
+
+See the proof-of-concept [example](https://github.com/returnnullptr/event-outbox-example).
+
 ## Installation
 
 With [pip](https://pypi.org/project/pip/):
@@ -15,10 +24,6 @@ With [poetry](https://python-poetry.org/):
 ```bash
 poetry add event-outbox
 ```
-
-## Usage
-
-See the proof-of-concept [example](https://github.com/returnnullptr/event-outbox-example).
 
 ## Development
 
