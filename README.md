@@ -4,7 +4,7 @@ The project is not production ready yet.
 
 ## Documentation
 
-- [Русский (Russian)](https://github.com/returnnullptr/event-outbox/tree/main/docs/ru-RU)
+- [Русский (Russian)](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/index.md)
 - ___TODO:__ Translate documentation_
 
 ## Usage
