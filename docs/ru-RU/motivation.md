@@ -207,3 +207,7 @@ _Интерфейс_ `EventListener` необходим для _инверсии
 
 > ___NOTE___:\
 > Посмотрите другие примеры контекстов, которые не зависят от _инфраструктуры_ в [исходном коде](https://github.com/returnnullptr/event-outbox-example/tree/main/example/domain).
+
+## Ссылки
+
+- [Интеграция](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/integration.md)

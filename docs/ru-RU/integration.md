@@ -436,3 +436,7 @@ async def main() -> None:
 [Apache Kafka]: https://kafka.apache.org/
 [MongoDB]: https://www.mongodb.com/
 [Pydantic]: https://docs.pydantic.dev/latest/ 
+
+## Ссылки
+
+- [Мотивация](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/motivation.md)
