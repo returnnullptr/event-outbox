@@ -80,6 +80,37 @@ class EventOutbox:
         self.kafka_producer = kafka_producer
 
     async def create_indexes(self) -> None:
+        await self._ensure_outbox_unique_index()
+        await self._ensure_outbox_ttl_index()
+        await self._ensure_inbox_ttl_index()
+
+    def event_listener(
+        self, mongo_session: AsyncIOMotorClientSession
+    ) -> AbstractAsyncContextManager[EventListener]:
+        async def func() -> AsyncIterator[EventListener]:
+            events: list[Event] = []
+            listener = EventListener(events)
+            async with _ensure_session_in_transaction(mongo_session):
+                yield listener
+                await self._insert_publish_intents_to_database(mongo_session, events)
+
+        return asynccontextmanager(func)()
+
+    def run_event_handler(
+        self, handler: EventHandler
+    ) -> AbstractAsyncContextManager[None]:
+        async def func() -> AsyncIterator[None]:
+            async with self._run_publish_events_task():
+                async with self._run_handle_events_task(handler):
+                    yield
+
+        return asynccontextmanager(func)()
+
+    @property
+    def _outbox(self):
+        return self.mongo_db[self.mongo_collection_outbox]
+
+    async def _ensure_outbox_unique_index(self):
         await self._outbox.create_index(
             [
                 ("payload.topic", 1),
@@ -89,60 +120,22 @@ class EventOutbox:
             name="idempotency",
             unique=True,
         )
-        await self._ensure_outbox_ttl_index()
-        await self._ensure_inbox_ttl_index()
 
-    def event_listener(
-        self, mongo_session: AsyncIOMotorClientSession
-    ) -> AbstractAsyncContextManager[EventListener]:
-        async def event_listener() -> AsyncIterator[EventListener]:
-            events: list[Event] = []
-            listener = EventListener(events)
-            async with _ensure_session_in_transaction(mongo_session):
-                yield listener
-                if events:
-                    documents = [
-                        {
-                            "payload": event.model_dump(mode="json"),
-                            "published": False,
-                        }
-                        for event in events
-                    ]
-                    events.clear()
-                    await self._outbox.insert_many(
-                        documents,
-                        session=mongo_session,
-                    )
-
-        return asynccontextmanager(event_listener)()
-
-    def run_event_handler(
-        self, handler: EventHandler
-    ) -> AbstractAsyncContextManager[None]:
-        async def run_event_handler() -> AsyncIterator[None]:
-            async with (
-                await self.mongo_client.start_session() as producer_session,
-                await self.mongo_client.start_session() as consumer_session,
-            ):
-                tasks = [
-                    asyncio.create_task(
-                        self._produce_messages(producer_session),
-                    ),
-                    asyncio.create_task(
-                        self._consume_messages(consumer_session, handler),
-                    ),
-                ]
-                try:
-                    yield
-                finally:
-                    for task in tasks:
-                        task.cancel()
-
-        return asynccontextmanager(run_event_handler)()
-
-    @property
-    def _outbox(self):
-        return self.mongo_db[self.mongo_collection_outbox]
+    async def _ensure_outbox_ttl_index(self):
+        while True:
+            try:
+                await self._outbox.create_index(
+                    "published_at",
+                    name="expiration",
+                    partialFilterExpression={"published": True},
+                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
+                )
+                break
+            except pymongo.errors.OperationFailure as ex:
+                if ex.code == _OperationFailureCode.IndexOptionsConflict:
+                    await self._outbox.drop_index("expiration")
+                else:
+                    raise
 
     @property
     def _inbox(self):
@@ -164,23 +157,33 @@ class EventOutbox:
                 else:
                     raise
 
-    async def _ensure_outbox_ttl_index(self):
-        while True:
-            try:
-                await self._outbox.create_index(
-                    "published_at",
-                    name="expiration",
-                    partialFilterExpression={"published": True},
-                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
-                )
-                break
-            except pymongo.errors.OperationFailure as ex:
-                if ex.code == _OperationFailureCode.IndexOptionsConflict:
-                    await self._outbox.drop_index("expiration")
-                else:
-                    raise
+    async def _insert_publish_intents_to_database(
+        self, mongo_session: AsyncIOMotorClientSession, events: list[Event]
+    ) -> None:
+        if events:
+            documents = [
+                {
+                    "payload": event.model_dump(mode="json"),
+                    "published": False,
+                }
+                for event in events
+            ]
+            events.clear()
+            await self._outbox.insert_many(
+                documents,
+                session=mongo_session,
+            )
 
-    async def _produce_messages(self, mongo_session: AsyncIOMotorClientSession) -> None:
+    @asynccontextmanager
+    async def _run_publish_events_task(self) -> AsyncIterator[None]:
+        async with await self.mongo_client.start_session() as mongo_session:
+            task = asyncio.create_task(self._publish_events(mongo_session))
+            try:
+                yield
+            finally:
+                task.cancel()
+
+    async def _publish_events(self, mongo_session: AsyncIOMotorClientSession) -> None:
         while True:
             assignment = self.kafka_consumer.assignment()
             try:
@@ -243,6 +246,17 @@ class EventOutbox:
                 )
                 # TODO: Configure delay between retries
                 await asyncio.sleep(1)
+
+    @asynccontextmanager
+    async def _run_handle_events_task(
+        self, handler: EventHandler
+    ) -> AsyncIterator[None]:
+        async with await self.mongo_client.start_session() as mongo_session:
+            task = asyncio.create_task(self._consume_messages(mongo_session, handler))
+            try:
+                yield
+            finally:
+                task.cancel()
 
     async def _next_change_event(
         self,
