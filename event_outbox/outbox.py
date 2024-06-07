@@ -75,8 +75,8 @@ class EventOutbox:
             if mongo_db is not None
             else self.mongo_client.get_default_database()
         )
-        self.mongo_collection_outbox = mongo_collection_outbox
-        self.mongo_collection_inbox = mongo_collection_inbox
+        self.mongo_outbox = self.mongo_db[mongo_collection_outbox]
+        self.mongo_inbox = self.mongo_db[mongo_collection_inbox]
         self.mongo_event_expiration = mongo_event_expiration
         self.kafka_consumer = kafka_consumer
         self.kafka_producer = kafka_producer
@@ -108,12 +108,8 @@ class EventOutbox:
 
         return asynccontextmanager(func)()
 
-    @property
-    def _outbox(self):
-        return self.mongo_db[self.mongo_collection_outbox]
-
     async def _ensure_outbox_unique_index(self):
-        await self._outbox.create_index(
+        await self.mongo_outbox.create_index(
             [
                 ("payload.topic", 1),
                 ("payload.content_schema", 1),
@@ -126,7 +122,7 @@ class EventOutbox:
     async def _ensure_outbox_ttl_index(self):
         while True:
             try:
-                await self._outbox.create_index(
+                await self.mongo_outbox.create_index(
                     "published_at",
                     name="expiration",
                     partialFilterExpression={"published": True},
@@ -135,18 +131,14 @@ class EventOutbox:
                 break
             except pymongo.errors.OperationFailure as ex:
                 if ex.code == _OperationFailureCode.IndexOptionsConflict:
-                    await self._outbox.drop_index("expiration")
+                    await self.mongo_outbox.drop_index("expiration")
                 else:
                     raise
-
-    @property
-    def _inbox(self):
-        return self.mongo_db[self.mongo_collection_inbox]
 
     async def _ensure_inbox_ttl_index(self):
         while True:
             try:
-                await self._inbox.create_index(
+                await self.mongo_inbox.create_index(
                     "handled_at",
                     name="expiration",
                     partialFilterExpression={"handled": True},
@@ -155,7 +147,7 @@ class EventOutbox:
                 break
             except pymongo.errors.OperationFailure as ex:
                 if ex.code == _OperationFailureCode.IndexOptionsConflict:
-                    await self._inbox.drop_index("expiration")
+                    await self.mongo_inbox.drop_index("expiration")
                 else:
                     raise
 
@@ -171,7 +163,7 @@ class EventOutbox:
                 for event in events
             ]
             events.clear()
-            await self._outbox.insert_many(
+            await self.mongo_outbox.insert_many(
                 documents,
                 session=mongo_session,
             )
@@ -189,7 +181,7 @@ class EventOutbox:
         while True:
             event_publisher = _EventPublisher(
                 mongo_session,
-                self._outbox,
+                self.mongo_outbox,
                 self.kafka_consumer,
                 self.kafka_producer,
             )
@@ -201,7 +193,7 @@ class EventOutbox:
                 logging.getLogger(__name__).critical(
                     "Unexpected exception occurred "
                     "while publishing events from %r collection",
-                    self.mongo_collection_outbox,
+                    self.mongo_outbox.name,
                     exc_info=True,
                 )
                 # TODO: Configure delay between retries
@@ -212,83 +204,33 @@ class EventOutbox:
         self, handler: EventHandler
     ) -> AsyncIterator[None]:
         async with await self.mongo_client.start_session() as mongo_session:
-            task = asyncio.create_task(self._consume_messages(mongo_session, handler))
+            task = asyncio.create_task(self._handle_events(mongo_session, handler))
             try:
                 yield
             finally:
                 task.cancel()
 
-    async def _consume_messages(
+    async def _handle_events(
         self, mongo_session: AsyncIOMotorClientSession, handler: EventHandler
     ) -> None:
         while True:
+            event_consumer = _EventConsumer(
+                mongo_session,
+                self.mongo_inbox,
+                self.kafka_consumer,
+                handler,
+            )
             try:
-                kafka_consumer_record = await self.kafka_consumer.getone()
-                event = Event.model_validate_json(kafka_consumer_record.value)
-
-                document_id = event.model_dump(
-                    mode="json",
-                    include={"topic", "content_schema", "idempotency_key"},
-                )
-
-                with suppress(pymongo.errors.DuplicateKeyError):
-                    await self._inbox.insert_one(
-                        {"_id": document_id, "handled": False},
-                        session=mongo_session,
-                    )
-
-                while True:
-                    try:
-                        await self._handle_event(
-                            document_id, event, mongo_session, handler
-                        )
-                        await self.kafka_consumer.commit()
-                        break
-                    except Exception:  # noqa
-                        logging.getLogger(__name__).critical(
-                            "Failed to handle event %r from %r collection",
-                            document_id,
-                            self.mongo_collection_inbox,
-                            exc_info=True,
-                        )
-                        # TODO: Configure delay between retries
-                        await asyncio.sleep(1)
+                await event_consumer.handle_events()
             except Exception:  # noqa, pragma: no cover
                 logging.getLogger(__name__).critical(
                     "Unexpected exception occurred "
                     "while handling events from %r collection",
-                    self.mongo_collection_outbox,
+                    self.mongo_outbox.name,
                     exc_info=True,
                 )
                 # TODO: Configure delay between retries
                 await asyncio.sleep(1)
-
-    async def _handle_event(
-        self,
-        document_id: Mapping[str, Any],
-        event: Event,
-        mongo_session: AsyncIOMotorClientSession,
-        handler: EventHandler,
-    ) -> None:
-        async with mongo_session.start_transaction():
-            result = await self._inbox.update_one(
-                {"_id": document_id, "handled": False},
-                {
-                    "$set": {
-                        "handled": True,
-                        "handled_at": datetime.now(tz=UTC),
-                    }
-                },
-                session=mongo_session,
-            )
-            if result.modified_count:
-                await handler(event, mongo_session)
-            else:
-                logging.getLogger(__name__).info(
-                    "Skipped already handled event %r from %r collection",
-                    document_id,
-                    self.mongo_collection_outbox,
-                )
 
 
 def _ensure_session_in_transaction(
@@ -312,12 +254,12 @@ class _EventPublisher:
     def __init__(
         self,
         mongo_session: AsyncIOMotorClientSession,
-        outbox_collection: AsyncIOMotorCollection,
+        mongo_outbox: AsyncIOMotorCollection,
         kafka_consumer: AIOKafkaConsumer,
         kafka_producer: AIOKafkaProducer,
     ) -> None:
         self.mongo_session = mongo_session
-        self.outbox_collection = outbox_collection
+        self.mongo_outbox = mongo_outbox
         self.kafka_consumer = kafka_consumer
         self.kafka_producer = kafka_producer
         self.assignment = kafka_consumer.assignment()
@@ -328,12 +270,12 @@ class _EventPublisher:
 
     async def publish_events(self) -> None:
         async for intent in self._iterate_intents():
-            await self._publish_event(intent)
+            await self._publish(intent)
 
     async def _iterate_intents(self) -> AsyncIterator[_EventPublishIntent]:
         latest_handled_object_id: ObjectId | None = None
 
-        async for document in self.outbox_collection.find(
+        async for document in self.mongo_outbox.find(
             {"published": False},
             session=self.mongo_session,
         ):
@@ -361,7 +303,7 @@ class _EventPublisher:
         self, start_at_operation_time: Timestamp
     ) -> AsyncIterator[Mapping[str, Any]]:
         pipeline = [{"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}]
-        change_stream = self.outbox_collection.watch(
+        change_stream = self.mongo_outbox.watch(
             pipeline,
             start_at_operation_time=start_at_operation_time,
             session=self.mongo_session,
@@ -378,7 +320,7 @@ class _EventPublisher:
                         yield change_event["fullDocument"]
 
                 except _ChangeStreamInvalidated as ex:
-                    change_stream = self.outbox_collection.watch(
+                    change_stream = self.mongo_outbox.watch(
                         pipeline,
                         start_after=ex.resume_token,
                         session=self.mongo_session,
@@ -398,21 +340,15 @@ class _EventPublisher:
                 task.cancel()
                 raise _PartitionAssignmentChanged
 
-    async def _publish_event(self, intent: _EventPublishIntent) -> None:
+    async def _publish(self, intent: _EventPublishIntent) -> None:
         event = Event.model_validate(intent["payload"])
-        partition = event.partition_key % len(
-            self.kafka_consumer.partitions_for_topic(event.topic)
-        )
-        if not any(
-            topic_partition.partition == partition
-            for topic_partition in self.kafka_consumer.assignment()
-            if topic_partition.topic == event.topic
-        ):
+        partition = self._partition(event)
+        if not self._assigned(event.topic, partition):
             return
 
         async with self.mongo_session.start_transaction():
             published_at = datetime.now(tz=UTC)
-            update_result = await self.outbox_collection.update_one(
+            update_result = await self.mongo_outbox.update_one(
                 {"_id": intent["_id"], "published": False},
                 {"$set": {"published": True, "published_at": published_at}},
                 session=self.mongo_session,
@@ -428,7 +364,85 @@ class _EventPublisher:
                 logging.getLogger(__name__).info(
                     "Skipped already published event %r from %r collection",
                     intent["_id"],
-                    self.outbox_collection.name,
+                    self.mongo_outbox.name,
+                )
+
+    def _partition(self, event: Event) -> int:
+        return event.partition_key % len(
+            self.kafka_consumer.partitions_for_topic(event.topic)
+        )
+
+    def _assigned(self, topic: str, partition: int) -> bool:
+        return any(
+            topic_partition.partition == partition
+            for topic_partition in self.assignment
+            if topic_partition.topic == topic
+        )
+
+
+class _EventConsumer:
+    def __init__(
+        self,
+        mongo_session: AsyncIOMotorClientSession,
+        mongo_inbox: AsyncIOMotorCollection,
+        kafka_consumer: AIOKafkaConsumer,
+        event_handler: EventHandler,
+    ) -> None:
+        self.mongo_session = mongo_session
+        self.mongo_inbox = mongo_inbox
+        self.kafka_consumer = kafka_consumer
+        self.event_handler = event_handler
+
+    async def handle_events(self) -> None:
+        while True:
+            kafka_consumer_record = await self.kafka_consumer.getone()
+            event = Event.model_validate_json(kafka_consumer_record.value)
+
+            document_id = event.model_dump(
+                mode="json",
+                include={"topic", "content_schema", "idempotency_key"},
+            )
+
+            with suppress(pymongo.errors.DuplicateKeyError):
+                await self.mongo_inbox.insert_one(
+                    {"_id": document_id, "handled": False},
+                    session=self.mongo_session,
+                )
+
+            while True:
+                try:
+                    await self._handle_event(document_id, event)
+                    await self.kafka_consumer.commit()
+                    break
+                except Exception:  # noqa
+                    logging.getLogger(__name__).critical(
+                        "Failed to handle event %r from %r collection",
+                        document_id,
+                        self.mongo_inbox.name,
+                        exc_info=True,
+                    )
+                    # TODO: Configure delay between retries
+                    await asyncio.sleep(1)
+
+    async def _handle_event(self, document_id: Mapping[str, Any], event: Event) -> None:
+        async with self.mongo_session.start_transaction():
+            result = await self.mongo_inbox.update_one(
+                {"_id": document_id, "handled": False},
+                {
+                    "$set": {
+                        "handled": True,
+                        "handled_at": datetime.now(tz=UTC),
+                    }
+                },
+                session=self.mongo_session,
+            )
+            if result.modified_count:
+                await self.event_handler(event, self.mongo_session)
+            else:
+                logging.getLogger(__name__).info(
+                    "Skipped already handled event %r from %r collection",
+                    document_id,
+                    self.mongo_inbox.name,
                 )
 
 
