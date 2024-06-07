@@ -69,17 +69,17 @@ class EventOutbox:
         mongo_collection_inbox: str = "transactional-inbox",
         mongo_event_expiration: timedelta = timedelta(days=1),
     ) -> None:
-        self.mongo_client = mongo_client
-        self.mongo_db = (
+        self._mongo_client = mongo_client
+        self._mongo_db = (
             mongo_db
             if mongo_db is not None
-            else self.mongo_client.get_default_database()
+            else self._mongo_client.get_default_database()
         )
-        self.mongo_outbox = self.mongo_db[mongo_collection_outbox]
-        self.mongo_inbox = self.mongo_db[mongo_collection_inbox]
-        self.mongo_event_expiration = mongo_event_expiration
-        self.kafka_consumer = kafka_consumer
-        self.kafka_producer = kafka_producer
+        self._mongo_outbox = self._mongo_db[mongo_collection_outbox]
+        self._mongo_inbox = self._mongo_db[mongo_collection_inbox]
+        self._mongo_event_expiration = mongo_event_expiration
+        self._kafka_consumer = kafka_consumer
+        self._kafka_producer = kafka_producer
 
     async def create_indexes(self) -> None:
         await self._ensure_outbox_unique_index()
@@ -109,7 +109,7 @@ class EventOutbox:
         return asynccontextmanager(func)()
 
     async def _ensure_outbox_unique_index(self):
-        await self.mongo_outbox.create_index(
+        await self._mongo_outbox.create_index(
             [
                 ("payload.topic", 1),
                 ("payload.content_schema", 1),
@@ -122,32 +122,36 @@ class EventOutbox:
     async def _ensure_outbox_ttl_index(self):
         while True:
             try:
-                await self.mongo_outbox.create_index(
+                await self._mongo_outbox.create_index(
                     "published_at",
                     name="expiration",
                     partialFilterExpression={"published": True},
-                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
+                    expireAfterSeconds=int(
+                        self._mongo_event_expiration.total_seconds()
+                    ),
                 )
                 break
             except pymongo.errors.OperationFailure as ex:
                 if ex.code == _OperationFailureCode.IndexOptionsConflict:
-                    await self.mongo_outbox.drop_index("expiration")
+                    await self._mongo_outbox.drop_index("expiration")
                 else:
                     raise
 
     async def _ensure_inbox_ttl_index(self):
         while True:
             try:
-                await self.mongo_inbox.create_index(
+                await self._mongo_inbox.create_index(
                     "handled_at",
                     name="expiration",
                     partialFilterExpression={"handled": True},
-                    expireAfterSeconds=int(self.mongo_event_expiration.total_seconds()),
+                    expireAfterSeconds=int(
+                        self._mongo_event_expiration.total_seconds()
+                    ),
                 )
                 break
             except pymongo.errors.OperationFailure as ex:
                 if ex.code == _OperationFailureCode.IndexOptionsConflict:
-                    await self.mongo_inbox.drop_index("expiration")
+                    await self._mongo_inbox.drop_index("expiration")
                 else:
                     raise
 
@@ -163,14 +167,14 @@ class EventOutbox:
                 for event in events
             ]
             events.clear()
-            await self.mongo_outbox.insert_many(
+            await self._mongo_outbox.insert_many(
                 documents,
                 session=mongo_session,
             )
 
     @asynccontextmanager
     async def _run_publish_events_task(self) -> AsyncIterator[None]:
-        async with await self.mongo_client.start_session() as mongo_session:
+        async with await self._mongo_client.start_session() as mongo_session:
             task = asyncio.create_task(self._publish_events(mongo_session))
             try:
                 yield
@@ -181,9 +185,9 @@ class EventOutbox:
         while True:
             event_publisher = _EventPublisher(
                 mongo_session,
-                self.mongo_outbox,
-                self.kafka_consumer,
-                self.kafka_producer,
+                self._mongo_outbox,
+                self._kafka_consumer,
+                self._kafka_producer,
             )
             try:
                 await event_publisher.publish_events()
@@ -193,7 +197,7 @@ class EventOutbox:
                 logging.getLogger(__name__).critical(
                     "Unexpected exception occurred "
                     "while publishing events from %r collection",
-                    self.mongo_outbox.name,
+                    self._mongo_outbox.name,
                     exc_info=True,
                 )
                 # TODO: Configure delay between retries
@@ -203,7 +207,7 @@ class EventOutbox:
     async def _run_handle_events_task(
         self, handler: EventHandler
     ) -> AsyncIterator[None]:
-        async with await self.mongo_client.start_session() as mongo_session:
+        async with await self._mongo_client.start_session() as mongo_session:
             task = asyncio.create_task(self._handle_events(mongo_session, handler))
             try:
                 yield
@@ -216,8 +220,8 @@ class EventOutbox:
         while True:
             event_consumer = _EventConsumer(
                 mongo_session,
-                self.mongo_inbox,
-                self.kafka_consumer,
+                self._mongo_inbox,
+                self._kafka_consumer,
                 handler,
             )
             try:
@@ -226,7 +230,7 @@ class EventOutbox:
                 logging.getLogger(__name__).critical(
                     "Unexpected exception occurred "
                     "while handling events from %r collection",
-                    self.mongo_outbox.name,
+                    self._mongo_outbox.name,
                     exc_info=True,
                 )
                 # TODO: Configure delay between retries

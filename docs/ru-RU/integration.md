@@ -15,13 +15,16 @@
 Эти процессы запускаются контекстным менеджером `EventOutbox.run_event_handler` в `lifespan` приложения на [FastAPI]:
 
 ```python
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Annotated, AsyncIterator
-from event_outbox import EventOutbox, Event
-from motor.motor_asyncio import AsyncIOMotorClientSession, AsyncIOMotorClient
-from contextlib import asynccontextmanager, AsyncExitStack
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # noinspection PyUnresolvedReferences
 from fastapi import Depends, FastAPI
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorClientSession
+
+from event_outbox import Event, EventOutbox
+
 
 def get_event_outbox() -> EventOutbox:
     raise NotImplementedError
@@ -32,7 +35,7 @@ EventOutboxDependency = Annotated[EventOutbox, Depends(get_event_outbox)]
 
 # noinspection PyUnusedLocal
 async def event_handler(
-    event: Event, 
+    event: Event,
     session: AsyncIOMotorClientSession,
     outbox: EventOutbox,
 ) -> None:
@@ -70,8 +73,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
         event_outbox = EventOutbox(
-            mongo_client, 
-            kafka_producer, 
+            mongo_client,
+            kafka_producer,
             kafka_consumer,
         )
         await event_outbox.create_indexes()
@@ -103,17 +106,22 @@ def app_factory() -> FastAPI:
 
 ```python
 from typing import Annotated
-from event_outbox import EventOutbox
-from pydantic import BaseModel
+
 # noinspection PyUnresolvedReferences
 from fastapi import Depends, FastAPI
+from pydantic import BaseModel
+
+from event_outbox import EventOutbox
+
 
 def get_event_outbox() -> EventOutbox:
     raise NotImplementedError
 
+
 EventOutboxDependency = Annotated[EventOutbox, Depends(get_event_outbox)]
 
 app = FastAPI()
+
 
 @app.post("/")
 async def request_handler(
@@ -126,13 +134,15 @@ async def request_handler(
 Внедрение зависимости `EventOutbox` в обработчики событий не обязательно:
 
 ```python
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import AsyncIterator
-from event_outbox import EventOutbox, Event
-from motor.motor_asyncio import AsyncIOMotorClientSession, AsyncIOMotorClient
-from contextlib import asynccontextmanager, AsyncExitStack
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # noinspection PyUnresolvedReferences
 from fastapi import FastAPI
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorClientSession
+
+from event_outbox import Event, EventOutbox
 
 
 # noinspection PyUnusedLocal
@@ -186,15 +196,22 @@ def app_factory() -> FastAPI:
 
 ```python
 from typing import Annotated, Literal
-from event_outbox import Event, EventListener, EventOutbox
-from pydantic import BaseModel
-# noinspection PyUnresolvedReferences
-from fastapi import APIRouter, Depends
+
 # noinspection PyUnresolvedReferences
 import bounded_context
+# noinspection PyUnresolvedReferences
+from fastapi import APIRouter, Depends
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+
+from event_outbox import Event, EventListener, EventOutbox
 
 
 def get_event_outbox() -> EventOutbox:
+    raise NotImplementedError
+
+
+def get_mongo_client() -> EventOutbox:
     raise NotImplementedError
 
 
@@ -204,9 +221,11 @@ router = APIRouter()
 @router.post("/")
 async def request_handler(
     outbox: Annotated[EventOutbox, Depends(get_event_outbox)],
+    mongo_client: Annotated[AsyncIOMotorClient, Depends(get_mongo_client)],
 ) -> BaseModel:
+    db = mongo_client.get_default_database()
     role = bounded_context.Role("role-1")
-    async with await outbox.mongo_client.start_session() as session:
+    async with await mongo_client.start_session() as session:
         async with outbox.event_listener(session) as listener:
             aggregate = bounded_context.Aggregate("role-1")
             role.command(
@@ -215,7 +234,7 @@ async def request_handler(
                 bounded_context.ValueObject.name,
                 BoundedContextEventListener(listener),
             )
-            await outbox.mongo_db["aggregates"].insert_one(
+            await db["aggregates"].insert_one(
                 {
                     "role_id": aggregate.role_id,
                     "entity_id": aggregate.entity.id if aggregate.entity else None,
@@ -255,14 +274,22 @@ class DomainEvent(Event):
 
 ```python
 from typing import Literal
+
+from motor.motor_asyncio import AsyncIOMotorClient
+
 from event_outbox import Event, EventOutbox
+
 
 class EventOccurred(Event):
     topic: Literal["bounded_context"] = "bounded_context"
     content_schema: Literal["EventOccurred"] = "EventOccurred"
 
-async def request_handler(outbox: EventOutbox) -> None:
-    async with await outbox.mongo_client.start_session() as session:
+
+async def request_handler(
+    outbox: EventOutbox,
+    mongo_client: AsyncIOMotorClient,
+) -> None:
+    async with await mongo_client.start_session() as session:
         async with outbox.event_listener(session) as listener:
             listener.event_occurred(EventOccurred())
 ```
@@ -288,14 +315,19 @@ async def request_handler(outbox: EventOutbox) -> None:
 #### event_outbox.EventListener
 
 ```python
-from pydantic import BaseModel
 from contextlib import AbstractAsyncContextManager
-from motor.motor_asyncio import AsyncIOMotorClientSession
 
-class Event(BaseModel): ...
+from motor.motor_asyncio import AsyncIOMotorClientSession
+from pydantic import BaseModel
+
+
+class Event(BaseModel):
+    ...
+
 
 class EventListener:
     def event_occurred(self, event: Event) -> None: ...
+
 
 class EventOutbox:
     def event_listener(
@@ -308,13 +340,17 @@ class EventOutbox:
 
 ```python
 from typing import Literal
-from event_outbox import Event, EventOutbox
+
 from motor.motor_asyncio import AsyncIOMotorClientSession
+
+from event_outbox import Event, EventOutbox
+
 
 class EventOccurred(Event):
     topic: Literal["bounded_context"] = "bounded_context"
     content_schema: Literal["EventOccurred"] = "EventOccurred"
-    
+
+
 async def handler(outbox: EventOutbox) -> ...:
     session: AsyncIOMotorClientSession = ...
 
@@ -346,16 +382,19 @@ class EventListener(ABC):
 
 ```python
 from typing import Literal
-from event_outbox import EventListener, Event
 
 # noinspection PyUnresolvedReferences
 import bounded_context
+
+from event_outbox import Event, EventListener
+
 
 class EventOccurred(Event):
     topic: Literal["bounded_context"] = "bounded_context"
     content_schema: Literal["EventOccurred"] = "EventOccurred"
     role_id: str
     value: str
+
 
 class BoundedContextEventListener(bounded_context.EventListener):
     def __init__(self, listener: EventListener) -> None:
@@ -364,7 +403,7 @@ class BoundedContextEventListener(bounded_context.EventListener):
     def domain_event(self, aggregate: bounded_context.Aggregate) -> None:
         self.listener.event_occurred(
             EventOccurred(
-                role_id=aggregate.role_id, 
+                role_id=aggregate.role_id,
                 value=aggregate.value_object,
             )
         )
@@ -380,8 +419,9 @@ class BoundedContextEventListener(bounded_context.EventListener):
 Когда событие поступает по сети, оно сохраняется в базу данных, инициализируется [оптимистическая блокировка](https://ru.wikipedia.org/wiki/%D0%91%D0%BB%D0%BE%D0%BA%D0%B8%D1%80%D0%BE%D0%B2%D0%BA%D0%B0_(%D0%A1%D0%A3%D0%91%D0%94)), после обрабатывается. Если в двух транзакциях произойдет обработка одного и того же события, то только одно измененеие будет зафиксировано. Библиотека [event-outbox] реализует шаблон `Idempotent Consumer` / `Transactional Inbox`.
 
 ```python
-from event_outbox import Event, EventOutbox
 from motor.motor_asyncio import AsyncIOMotorClientSession, AsyncIOMotorDatabase
+
+from event_outbox import Event, EventOutbox
 
 
 # noinspection PyUnusedLocal

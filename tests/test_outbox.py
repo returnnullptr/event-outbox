@@ -121,7 +121,7 @@ async def test_transactional_inbox_deduplicate_events(
 ) -> None:
     duplicate_event = ExpectedEvent(topic=topic)
     for _ in range(2):
-        await event_outbox.kafka_producer.send_and_wait(
+        await event_outbox._kafka_producer.send_and_wait(
             duplicate_event.topic,
             duplicate_event.model_dump_json().encode(),
             partition=0,
@@ -140,7 +140,7 @@ async def test_transactional_inbox_retry_handle(
     topic: str,
 ) -> None:
     expected_event = ExpectedEvent(topic=topic)
-    await event_outbox.kafka_producer.send_and_wait(
+    await event_outbox._kafka_producer.send_and_wait(
         expected_event.topic,
         expected_event.model_dump_json().encode(),
         partition=0,
@@ -165,7 +165,7 @@ async def test_create_listener_in_event_handler(
     topic: str,
 ) -> None:
     expected_event = ExpectedEvent(topic=topic)
-    await event_outbox.kafka_producer.send_and_wait(
+    await event_outbox._kafka_producer.send_and_wait(
         expected_event.topic,
         expected_event.model_dump_json().encode(),
         partition=0,
@@ -185,7 +185,7 @@ async def test_change_event_expiration(
     event_outbox: EventOutbox,
     event_expiration_seconds: int,
 ) -> None:
-    event_outbox.mongo_event_expiration = timedelta(
+    event_outbox._mongo_event_expiration = timedelta(
         seconds=event_expiration_seconds + 1
     )
     await event_outbox.create_indexes()
