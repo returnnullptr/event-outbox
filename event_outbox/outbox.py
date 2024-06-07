@@ -12,18 +12,20 @@ from enum import IntEnum
 from typing import Any, AsyncIterator, Mapping, Protocol, TypeAlias, cast
 
 import pymongo.errors
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from bson import ObjectId, Timestamp
 from motor.motor_asyncio import (
     AsyncIOMotorChangeStream,
     AsyncIOMotorClient,
     AsyncIOMotorClientSession,
+    AsyncIOMotorCollection,
     AsyncIOMotorDatabase,
 )
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 __all__ = ["Event", "EventListener", "EventOutbox", "EventHandler"]
 
+_EventPublishIntent: TypeAlias = Mapping[str, Any]
 _ChangeEvent: TypeAlias = Mapping[str, Any]
 
 
@@ -185,56 +187,14 @@ class EventOutbox:
 
     async def _publish_events(self, mongo_session: AsyncIOMotorClientSession) -> None:
         while True:
-            assignment = self.kafka_consumer.assignment()
+            event_publisher = _EventPublisher(
+                mongo_session,
+                self._outbox,
+                self.kafka_consumer,
+                self.kafka_producer,
+            )
             try:
-                latest_handled_object_id: ObjectId | None = None
-                async for document in self._outbox.find(
-                    {"published": False},
-                    session=mongo_session,
-                ):
-                    if assignment != self.kafka_consumer.assignment():
-                        raise _PartitionAssignmentChanged
-
-                    await self._publish_event(mongo_session, document)
-                    latest_handled_object_id = document["_id"]
-
-                if latest_handled_object_id:
-                    id_generated_at = latest_handled_object_id.generation_time
-                    start_at_operation_time = Timestamp(id_generated_at, 0)
-                else:
-                    cluster_time_document = cast(
-                        Mapping[str, Any], mongo_session.cluster_time
-                    )
-                    start_at_operation_time = cluster_time_document["clusterTime"]
-
-                pipeline = [
-                    {"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}
-                ]
-                change_stream = self._outbox.watch(
-                    pipeline,
-                    start_at_operation_time=start_at_operation_time,
-                    session=mongo_session,
-                )
-                while True:
-                    async with change_stream:
-                        try:
-                            while True:
-                                change_event = await self._next_change_event(
-                                    change_stream, assignment
-                                )
-
-                                if change_event["operationType"] == "invalidate":
-                                    raise _ChangeStreamInvalidated(change_event["_id"])
-
-                                document = change_event["fullDocument"]
-                                await self._publish_event(mongo_session, document)
-
-                        except _ChangeStreamInvalidated as ex:
-                            change_stream = self._outbox.watch(
-                                pipeline,
-                                start_after=ex.resume_token,
-                                session=mongo_session,
-                            )
+                await event_publisher.publish_events()
             except _PartitionAssignmentChanged:
                 pass
             except Exception:  # noqa, pragma: no cover
@@ -257,59 +217,6 @@ class EventOutbox:
                 yield
             finally:
                 task.cancel()
-
-    async def _next_change_event(
-        self,
-        change_stream: AsyncIOMotorChangeStream,
-        producer_assignment: frozenset[TopicPartition],
-    ) -> _ChangeEvent:
-        task: asyncio.Task[_ChangeEvent] = asyncio.create_task(anext(change_stream))
-        while True:
-            with suppress(TimeoutError):
-                return await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=1,  # TODO: Configure timeout
-                )
-            if producer_assignment != self.kafka_consumer.assignment():
-                task.cancel()
-                raise _PartitionAssignmentChanged
-
-    async def _publish_event(
-        self,
-        mongo_session: AsyncIOMotorClientSession,
-        document: Mapping[str, Any],
-    ) -> None:
-        event = Event.model_validate(document["payload"])
-        partition = event.partition_key % len(
-            self.kafka_consumer.partitions_for_topic(event.topic)
-        )
-        if not any(
-            topic_partition.partition == partition
-            for topic_partition in self.kafka_consumer.assignment()
-            if topic_partition.topic == event.topic
-        ):
-            return
-
-        async with mongo_session.start_transaction():
-            published_at = datetime.now(tz=UTC)
-            update_result = await self._outbox.update_one(
-                {"_id": document["_id"], "published": False},
-                {"$set": {"published": True, "published_at": published_at}},
-                session=mongo_session,
-            )
-            if update_result.modified_count:
-                await self.kafka_producer.send_and_wait(
-                    event.topic,
-                    event.model_dump_json().encode(),
-                    partition=partition,
-                    timestamp_ms=int(published_at.timestamp() * 1000),
-                )
-            else:
-                logging.getLogger(__name__).info(
-                    "Skipped already published event %r from %r collection",
-                    document["_id"],
-                    self.mongo_collection_outbox,
-                )
 
     async def _consume_messages(
         self, mongo_session: AsyncIOMotorClientSession, handler: EventHandler
@@ -399,6 +306,130 @@ class _ChangeStreamInvalidated(Exception):
 
 class _PartitionAssignmentChanged(Exception):
     pass
+
+
+class _EventPublisher:
+    def __init__(
+        self,
+        mongo_session: AsyncIOMotorClientSession,
+        outbox_collection: AsyncIOMotorCollection,
+        kafka_consumer: AIOKafkaConsumer,
+        kafka_producer: AIOKafkaProducer,
+    ) -> None:
+        self.mongo_session = mongo_session
+        self.outbox_collection = outbox_collection
+        self.kafka_consumer = kafka_consumer
+        self.kafka_producer = kafka_producer
+        self.assignment = kafka_consumer.assignment()
+
+    @property
+    def _assignment_changed(self) -> bool:
+        return self.assignment != self.kafka_consumer.assignment()
+
+    async def publish_events(self) -> None:
+        async for intent in self._iterate_intents():
+            await self._publish_event(intent)
+
+    async def _iterate_intents(self) -> AsyncIterator[_EventPublishIntent]:
+        latest_handled_object_id: ObjectId | None = None
+
+        async for document in self.outbox_collection.find(
+            {"published": False},
+            session=self.mongo_session,
+        ):
+            if self._assignment_changed:
+                raise _PartitionAssignmentChanged
+
+            yield document
+            latest_handled_object_id = document["_id"]
+
+        if latest_handled_object_id:
+            id_generated_at = latest_handled_object_id.generation_time
+            start_at_operation_time = Timestamp(id_generated_at, 0)
+        else:
+            # TODO: Consider delay between
+            cluster_time_document = cast(
+                Mapping[str, Any],
+                self.mongo_session.cluster_time,
+            )
+            start_at_operation_time = cluster_time_document["clusterTime"]
+
+        async for document in self._subscribe_to_change_stream(start_at_operation_time):
+            yield document
+
+    async def _subscribe_to_change_stream(
+        self, start_at_operation_time: Timestamp
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        pipeline = [{"$match": {"operationType": {"$in": ["insert", "invalidate"]}}}]
+        change_stream = self.outbox_collection.watch(
+            pipeline,
+            start_at_operation_time=start_at_operation_time,
+            session=self.mongo_session,
+        )
+        while True:
+            async with change_stream:
+                try:
+                    while True:
+                        change_event = await self._next_change_event(change_stream)
+
+                        if change_event["operationType"] == "invalidate":
+                            raise _ChangeStreamInvalidated(change_event["_id"])
+
+                        yield change_event["fullDocument"]
+
+                except _ChangeStreamInvalidated as ex:
+                    change_stream = self.outbox_collection.watch(
+                        pipeline,
+                        start_after=ex.resume_token,
+                        session=self.mongo_session,
+                    )
+
+    async def _next_change_event(
+        self, change_stream: AsyncIOMotorChangeStream
+    ) -> _ChangeEvent:
+        task: asyncio.Task[_ChangeEvent] = asyncio.create_task(anext(change_stream))
+        while True:
+            with suppress(TimeoutError):
+                return await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=1,  # TODO: Configure timeout
+                )
+            if self._assignment_changed:
+                task.cancel()
+                raise _PartitionAssignmentChanged
+
+    async def _publish_event(self, intent: _EventPublishIntent) -> None:
+        event = Event.model_validate(intent["payload"])
+        partition = event.partition_key % len(
+            self.kafka_consumer.partitions_for_topic(event.topic)
+        )
+        if not any(
+            topic_partition.partition == partition
+            for topic_partition in self.kafka_consumer.assignment()
+            if topic_partition.topic == event.topic
+        ):
+            return
+
+        async with self.mongo_session.start_transaction():
+            published_at = datetime.now(tz=UTC)
+            update_result = await self.outbox_collection.update_one(
+                {"_id": intent["_id"], "published": False},
+                {"$set": {"published": True, "published_at": published_at}},
+                session=self.mongo_session,
+            )
+            if update_result.modified_count:
+                await self.kafka_producer.send_and_wait(
+                    event.topic,
+                    event.model_dump_json().encode(),
+                    partition=partition,
+                    timestamp_ms=int(published_at.timestamp() * 1000),
+                )
+            else:
+                logging.getLogger(__name__).info(
+                    "Skipped already published event %r from %r collection",
+                    intent["_id"],
+                    self.outbox_collection.name,
+                )
 
 
 class _OperationFailureCode(IntEnum):
