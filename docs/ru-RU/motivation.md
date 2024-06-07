@@ -22,94 +22,11 @@
 > ___NOTE___:\
 > Не все категории DDD обозначаются такой на диаграмме.
 
-Очень важно разделить систему на контексты (bounded context), которые обладают:
+Предметная область (domain) разделяется на контексты (bounded context), которые обладают:
 - _Сильной внутренней связностью_ (high cohesion), т.е. фокусируются на конкретном аспекте предметной области.
 - _Слабой внешней связанностью_ с другими контекстами (low coupling), т.е. события, происходящие в одном контексте слабо влияют на события, происходящие в другом контексте. 
 
 ![High Cohesion, Low Coupling.png](../assets/high_cohesion_low_coupling.png)
-
-## Инверсия зависимости 
-
-Под зависимостью понимается буквально зависимость на уровне исходного кода. Если модуль `b.py` напрямую или транзитивно импортирует модуль `a.py`, то говорится, что `b.py` зависит от `a.py`.
-
-```python
-"""
-File: a.py
-"""
-
-class A:
-    def method(self) -> None:
-        ...
-```
-
-```python
-"""
-File: b.py
-"""
-
-# noinspection PyUnresolvedReferences,PyPackageRequirements
-from a import A  # `b.py` depends on `a.py`
-
-class B:
-    def __init__(self) -> None:
-        self.a = A()
-```
-
-Такую зависимость можно инвертировать, определив интерфейс и поместив его в модуль `b.py`.
-
-```python
-"""
-File: a.py
-"""
-# noinspection PyUnresolvedReferences,PyPackageRequirements
-import b # `a.py` depends on `b.py`
-
-class A(b.A):
-    def method(self) -> None:
-        ...
-```
-
-```python
-"""
-File: b.py
-"""
-from abc import ABC, abstractmethod
-
-class A(ABC):
-    @abstractmethod
-    def method(self) -> None:
-        pass
-
-class B:
-    def __init__(self, a: A) -> None:
-        self.a = a
-```
-
-Теперь `a.py` зависит от `b.py`.
-
-> ___NOTE___:\
-> Таким образом можно инвертировать любую зависимость в коде, которым вы владеете
-
-Инверсия зависимости трубет механизма внедрения зависимости. Некоторые зависимости можно внеднить в точке входа в программу или на этапе инициализации:
-
-```python
-"""
-File: main.py
-"""
-# noinspection PyUnresolvedReferences,PyPackageRequirements
-import a
-# noinspection PyUnresolvedReferences,PyPackageRequirements
-import b
-
-def main() -> None:
-    _ = b.B(a.A())
-
-if __name__ == '__main__':
-    main()
-```
-
-> ___NOTE___:\
-> Точка входа в программу - не единственное место, где можно внедрять зависимости. 
 
 ## Объектно-ориентированное проектирование
 
@@ -197,6 +114,9 @@ class InvariantViolated(Exception):
 
 _Интерфейс_ `EventListener` необходим для _инверсии зависимости_ таким образом, чтобы _инфраструктура_ зависила от предметной области, а не наоборот. Разумеется, необходим механизм внедрения такой зависимости. 
 
+> ___TIP___:\
+> Подробнее про инверсию зависимостей можно [посмотреть здесь](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/dependency-inversion.md).
+
 С точки зрения кода в ограниченном контексте (bounded context):
 - Происходят некоторые события (domain events) 
 - На происходящие события реагируют другие ограниченные контексты (bounded contexts)
@@ -211,3 +131,4 @@ _Интерфейс_ `EventListener` необходим для _инверсии
 ## Ссылки
 
 - [Интеграция](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/integration.md)
+- [Инверсия зависимости](https://github.com/returnnullptr/event-outbox/blob/main/docs/ru-RU/dependency-inversion.md)
